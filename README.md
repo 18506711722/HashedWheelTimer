@@ -67,6 +67,7 @@ t1.rescheduleAsync(1000);
 
 // 优雅关闭（等待未完成任务）
 timer.shutdownGracefully(5, TimeUnit.SECONDS);
+```
 
 ### `AionHashedWheelTimer`
 - `newTimeout(Consumer<TaskEntry>, long delayMs)` → 注册一次性延时任务
