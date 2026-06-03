@@ -1,0 +1,833 @@
+package top.aion0573.comm.wheelTime;
+
+import java.text.SimpleDateFormat;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import java.util.concurrent.locks.LockSupport;
+import java.util.function.Consumer;
+
+/**
+ * 针对 MQTT 百万级连接 KeepAlive 检测深度优化的单线程时间轮。
+ *
+ * <h3>设计要点</h3>
+ * <ul>
+ *   <li><b>单线程调度</b>：所有桶操作（添加、取消、重排）都通过 {@code externalTasks} 队列提交给 worker 线程串行执行，消除并发竞争。</li>
+ *   <li><b>对象池</b>：使用 {@link ArrayDeque} 复用 {@link TaskEntry} 实例，降低 GC 压力。</li>
+ *   <li><b>O(1) 桶操作</b>：{@link TaskEntry#bucketIndex} 快速定位桶，桶内采用 {@link LinkedHashSet} 实现 O(1) 删除。</li>
+ *   <li><b>非阻塞接口</b>：提供 {@link Timeout#cancelAsync()} 与 {@link Timeout#rescheduleAsync(long)}，返回 {@link CompletableFuture}，避免阻塞调用方线程。</li>
+ *   <li><b>原地重排</b>：{@link Timeout#reschedule(long)} 在相同节点上更新延迟，避免先取消后新建的开销。</li>
+ *   <li><b>精确时钟追赶</b>：基于 {@link LockSupport#parkNanos} 自循环，支持 {@code maxSkipTicks} 限制最大追赶步数。</li>
+ *   <li><b>丰富监控</b>：提供调度延迟 EMA、任务执行耗时（平均/最大）、桶深度、取消/异常/停止计数等指标。</li>
+ * </ul>
+ *
+ * <h3>线程模型</h3>
+ * 所有对时间轮状态（桶、currentTick）的修改均在 worker 线程内完成。外部线程通过 {@code externalTasks} 提交操作，
+ * 再由 worker 在推进时钟前批量执行。这种设计保证了无锁化的内部状态访问。
+ *
+ * @author aion0573
+ */
+public class AionHashedWheelTimer {
+
+    // ==================== 对象池 ====================
+    /** 对象池最大容量 */
+    private static final int POOL_CAPACITY = 65536;
+    /** 复用 TaskEntry 的池，单线程（worker）访问，使用 ArrayDeque 避免 Vector 同步开销 */
+    private final Deque<TaskEntry> entryPool = new ArrayDeque<>();
+
+    /**
+     * 从池中获取或新建一个 TaskEntry 并重置状态。
+     *
+     * @param task            到期执行的任务
+     * @param remainingRounds 剩余轮数
+     * @return 初始化后的 TaskEntry
+     */
+    private TaskEntry newTaskEntry(Consumer<TaskEntry> task, long remainingRounds) {
+        TaskEntry e = entryPool.isEmpty() ? new TaskEntry() : entryPool.pop();
+        e.reset(task, remainingRounds);
+        return e;
+    }
+
+    /**
+     * 回收 TaskEntry 到对象池。
+     *
+     * @param entry 已执行或已取消的 entry
+     */
+    private void recycle(TaskEntry entry) {
+        entry.clear();
+        if (entryPool.size() < POOL_CAPACITY) {
+            entryPool.push(entry);
+        }
+    }
+
+    // ==================== 任务节点 ====================
+    /**
+     * 时间轮中的任务节点，包含执行状态、剩余轮数以及桶索引等元数据。
+     */
+    public static class TaskEntry {
+        /** 初始状态 */
+        static final int ST_INIT = 0;
+        /** 已取消 */
+        static final int ST_CANCELLED = 1;
+        /** 已到期（正在执行或即将执行） */
+        static final int ST_EXPIRED = 2;
+
+        volatile int state = ST_INIT;      // 当前状态，worker 修改，外部可能读取
+        Consumer<TaskEntry> task;          // 到期回调
+        long remainingRounds;             // 剩余指针圈数
+        long periodTicks;                 // 周期任务的间隔 tick 数，0 表示一次性
+        long createTimeNanos;             // 注册时间（纳秒），用于统计延迟
+        int bucketIndex = -1;             // 所在桶的下标，-1 表示不在任何桶中
+
+        TaskEntry() {}
+
+        /**
+         * 重置节点字段以复用实例。
+         */
+        void reset(Consumer<TaskEntry> task, long remainingRounds) {
+            this.task = task;
+            this.remainingRounds = remainingRounds;
+            this.periodTicks = 0;
+            this.state = ST_INIT;
+            this.createTimeNanos = System.nanoTime();
+            this.bucketIndex = -1;
+        }
+
+        /**
+         * 清除引用，帮助 GC。
+         */
+        void clear() {
+            this.task = null;
+            this.state = ST_INIT;
+            this.bucketIndex = -1;
+        }
+    }
+
+    // ==================== 桶 ====================
+    /**
+     * 时间轮中的桶，内部使用 {@link LinkedHashSet} 维护任务，保证插入顺序同时提供 O(1) 删除。
+     */
+    static class Bucket {
+        final LinkedHashSet<TaskEntry> set = new LinkedHashSet<>();
+
+        void add(TaskEntry entry) {
+            set.add(entry);
+        }
+
+        boolean remove(TaskEntry entry) {
+            return set.remove(entry);
+        }
+
+        int size() {
+            return set.size();
+        }
+
+        /**
+         * 将桶内所有任务转移到给定的列表，并清空桶。
+         * @param sink 接收任务的目标列表
+         */
+        void drainTo(List<TaskEntry> sink) {
+            sink.addAll(set);
+            set.clear();
+        }
+    }
+
+    // ==================== 超时句柄 ====================
+    /**
+     * 可取消的任务句柄。
+     */
+    public interface Cancellable {
+        boolean cancel();
+    }
+
+    /**
+     * 时间轮返回的句柄，用于取消或重新调度任务。
+     * 同时提供阻塞版（兼容旧接口）和异步版（推荐）方法。
+     */
+    public static class Timeout implements Cancellable {
+        private final AionHashedWheelTimer timer;
+        private final TaskEntry entry;
+
+        Timeout(AionHashedWheelTimer timer, TaskEntry entry) {
+            this.timer = timer;
+            this.entry = entry;
+        }
+
+        /**
+         * 阻塞式取消任务，内部调用 {@link #cancelAsync()} 并等待结果。
+         * @return 是否成功取消
+         */
+        @Override
+        public boolean cancel() {
+            try {
+                return cancelAsync().get();
+            } catch (Exception e) {
+                return false;
+            }
+        }
+
+        /**
+         * 异步取消任务，提交到 worker 线程执行。
+         * @return 代表取消结果的 {@link CompletableFuture}
+         */
+        public CompletableFuture<Boolean> cancelAsync() {
+            return timer.cancelAsync(entry);
+        }
+
+        /**
+         * 阻塞式重设延迟，内部调用 {@link #rescheduleAsync(long)} 并等待结果。
+         * @param newDelayMs 新的延迟毫秒数
+         * @return 是否成功重设
+         */
+        public boolean reschedule(long newDelayMs) {
+            try {
+                return rescheduleAsync(newDelayMs).get();
+            } catch (Exception e) {
+                return false;
+            }
+        }
+
+        /**
+         * 异步重设延迟，原地更新该任务的下次触发时间，避免先取消后新建。
+         * @param newDelayMs 新的延迟毫秒数
+         * @return 代表重设结果的 {@link CompletableFuture}
+         */
+        public CompletableFuture<Boolean> rescheduleAsync(long newDelayMs) {
+            return timer.rescheduleAsync(entry, newDelayMs);
+        }
+
+        public boolean isCancelled() { return entry.state == TaskEntry.ST_CANCELLED; }
+        public boolean isExpired()  { return entry.state == TaskEntry.ST_EXPIRED; }
+        public boolean isDone()     { return entry.state != TaskEntry.ST_INIT; }
+    }
+
+    // ==================== 时间轮属性 ====================
+    private final int ticksPerWheel;                // 轮子槽数
+    private final long tickDurationNs;              // 每个 tick 的纳秒数
+    private final Bucket[] wheel;                   // 桶数组
+    private final AtomicInteger currentTick = new AtomicInteger(0); // 当前 tick 指针
+    private final Thread workerThread;              // 驱动线程（虚拟线程）
+    private final ExecutorService taskExecutor;     // 执行业务任务的线程池
+    private final boolean internalExecutor;         // 是否内部创建的线程池
+    private final Semaphore concurrencyLimiter;     // 任务并发度控制
+    private final LongAdder pendingCount = new LongAdder(); // 待处理任务数
+    private final int maxSkipTicks;                 // 最大追赶步数
+    private final Consumer<Throwable> exceptionHandler; // 异常处理器
+
+    /** 外部操作队列，所有公开 API 通过此队列提交操作给 worker 线程 */
+    private final ConcurrentLinkedQueue<Runnable> externalTasks = new ConcurrentLinkedQueue<>();
+
+    // 指标统计
+    private final AtomicLong totalSkippedTicks = new AtomicLong(0);
+    private final LongAdder completedTasks = new LongAdder();
+    private final LongAdder cancelledCount = new LongAdder();
+    private final LongAdder exceptionCount = new LongAdder();
+    private final LongAdder stoppedCount = new LongAdder();
+    private final AtomicInteger maxBucketDepth = new AtomicInteger(0);
+    private final AtomicLong emaDelayNanos = new AtomicLong(0);
+    private static final double EMA_ALPHA = 0.1;
+
+    // 任务执行耗时统计
+    private final LongAdder taskExecutionCount = new LongAdder();
+    private final AtomicLong maxExecutionTimeNs = new AtomicLong(0);
+    private final LongAdder totalExecutionTimeNs = new LongAdder();
+
+    /** worker 线程内复用的临时缓冲区，避免反复创建 */
+    private final List<TaskEntry> drainBuffer = new ArrayList<>(256);
+
+    // ==================== 构造器 ====================
+
+    /**
+     * 便捷构造器，默认 64 并发任务，最大追赶步数等于槽数。
+     */
+    public AionHashedWheelTimer(int ticksPerWheel, long tickDurationMs) {
+        this(ticksPerWheel, tickDurationMs, 64);
+    }
+
+    public AionHashedWheelTimer(int ticksPerWheel, long tickDurationMs, int maxConcurrentTasks) {
+        this(ticksPerWheel, tickDurationMs, maxConcurrentTasks, Math.max(ticksPerWheel, 100));
+    }
+
+    public AionHashedWheelTimer(int ticksPerWheel, long tickDurationMs,
+                                int maxConcurrentTasks, int maxSkipTicks) {
+        this(ticksPerWheel, tickDurationMs, maxConcurrentTasks, maxSkipTicks,
+                Executors.newVirtualThreadPerTaskExecutor(), true, Throwable::printStackTrace);
+    }
+
+    public AionHashedWheelTimer(int ticksPerWheel, long tickDurationMs,
+                                int maxConcurrentTasks, ExecutorService taskExecutor) {
+        this(ticksPerWheel, tickDurationMs, maxConcurrentTasks, Math.max(ticksPerWheel, 100),
+                taskExecutor, false, Throwable::printStackTrace);
+    }
+
+    /**
+     * 全参构造器。
+     *
+     * @param ticksPerWheel     时间轮槽数
+     * @param tickDurationMs    每个 tick 的毫秒数
+     * @param maxConcurrentTasks 最大同时执行的任务数，0 表示无限制
+     * @param maxSkipTicks      追赶时最大跳过的 tick 数
+     * @param taskExecutor      执行业务任务的线程池
+     * @param internalExecutor  taskExecutor 是否由内部创建（决定关闭时行为）
+     * @param exceptionHandler  任务执行异常时的处理器
+     */
+    public AionHashedWheelTimer(int ticksPerWheel, long tickDurationMs,
+                                int maxConcurrentTasks, int maxSkipTicks,
+                                ExecutorService taskExecutor, boolean internalExecutor,
+                                Consumer<Throwable> exceptionHandler) {
+        if (ticksPerWheel <= 0) throw new IllegalArgumentException("ticksPerWheel > 0");
+        if (tickDurationMs <= 0) throw new IllegalArgumentException("tickDurationMs > 0");
+        this.ticksPerWheel = ticksPerWheel;
+        this.tickDurationNs = TimeUnit.MILLISECONDS.toNanos(tickDurationMs);
+        this.maxSkipTicks = maxSkipTicks;
+        this.taskExecutor = taskExecutor;
+        this.internalExecutor = internalExecutor;
+        this.concurrencyLimiter = maxConcurrentTasks > 0 ?
+                new Semaphore(maxConcurrentTasks) : new Semaphore(Integer.MAX_VALUE);
+        this.exceptionHandler = exceptionHandler;
+
+        wheel = new Bucket[ticksPerWheel];
+        for (int i = 0; i < ticksPerWheel; i++) {
+            wheel[i] = new Bucket();
+        }
+
+        workerThread = Thread.ofVirtual().name("timer-wheel").start(this::run);
+    }
+
+    // ==================== 公共调度接口 ====================
+
+    /**
+     * 注册一次性延时任务。
+     *
+     * @param task    到期回调
+     * @param delayMs 延迟毫秒数，≤0 时立即执行（仍在外部线程触发，注意竞态）
+     * @return 可用于取消或重排的 {@link Timeout} 句柄
+     */
+    public Timeout newTimeout(Consumer<TaskEntry> task, long delayMs) {
+        if (delayMs <= 0) {
+            final TaskEntry immediate = newTaskEntry(task, 0);
+            immediate.state = TaskEntry.ST_EXPIRED;
+            pendingCount.increment();
+            taskExecutor.execute(() -> executeImmediate(immediate));
+            return new Timeout(this, immediate);
+        }
+        return schedule(task, delayMs, 0);
+    }
+
+    /**
+     * 注册固定速率周期性任务。
+     *
+     * @param task           到期回调
+     * @param initialDelayMs 首次延迟毫秒数
+     * @param periodMs       周期间隔毫秒数
+     * @return 可用于取消的 {@link Timeout} 句柄
+     */
+    public Timeout scheduleAtFixedRate(Consumer<TaskEntry> task, long initialDelayMs, long periodMs) {
+        if (periodMs <= 0) throw new IllegalArgumentException("periodMs > 0");
+        long periodTicks = TimeUnit.MILLISECONDS.toNanos(periodMs) / tickDurationNs;
+        if (periodTicks < 1) periodTicks = 1;
+        return schedule(task, initialDelayMs, periodTicks);
+    }
+
+    /**
+     * 内部通用调度方法，将任务放入时间轮。
+     *
+     * @param task        到期回调
+     * @param delayMs     延迟毫秒数
+     * @param periodTicks 周期 tick 数，0 表示一次性
+     * @return Timeout 句柄
+     */
+    private Timeout schedule(Consumer<TaskEntry> task, long delayMs, long periodTicks) {
+        long delayTicks = TimeUnit.MILLISECONDS.toNanos(delayMs) / tickDurationNs;
+        if (delayTicks > Long.MAX_VALUE - 1) delayTicks = Long.MAX_VALUE - 1;
+        final long totalTicks = delayTicks;
+        // 确保最少 1 tick，避免落入已过的当前槽
+        final int ticks = (int) (totalTicks % ticksPerWheel) == 0 && totalTicks > 0 ? 1 : (int) (totalTicks % ticksPerWheel);
+        final long rounds = totalTicks / ticksPerWheel;
+
+        final TaskEntry entry = newTaskEntry(task, rounds);
+        entry.periodTicks = periodTicks;
+
+        final Timeout timeout = new Timeout(this, entry);
+        // 提交给 worker 线程完成最终的槽位计算和入桶
+        externalTasks.offer(() -> {
+            pendingCount.increment();
+            int stopIndex = (int) ((currentTick.get() + ticks) % ticksPerWheel);
+            entry.bucketIndex = stopIndex;
+            wheel[stopIndex].add(entry);
+        });
+        return timeout;
+    }
+
+    // ==================== 异步取消 / 重排 ====================
+
+    /**
+     * 提交异步取消请求，由 worker 线程执行。
+     */
+    public CompletableFuture<Boolean> cancelAsync(TaskEntry entry) {
+        final CompletableFuture<Boolean> future = new CompletableFuture<>();
+        externalTasks.offer(() -> {
+            boolean result = doCancel(entry);
+            future.complete(result);
+        });
+        return future;
+    }
+
+    /**
+     * 提交异步重排请求，由 worker 线程执行。
+     */
+    public CompletableFuture<Boolean> rescheduleAsync(TaskEntry entry, long newDelayMs) {
+        final CompletableFuture<Boolean> future = new CompletableFuture<>();
+        externalTasks.offer(() -> {
+            boolean result = doReschedule(entry, newDelayMs);
+            future.complete(result);
+        });
+        return future;
+    }
+
+    // 阻塞版本内部调用异步版本
+    private boolean cancel(TaskEntry entry) {
+        try { return cancelAsync(entry).get(); } catch (Exception e) { return false; }
+    }
+
+    private boolean reschedule(TaskEntry entry, long newDelayMs) {
+        try { return rescheduleAsync(entry, newDelayMs).get(); } catch (Exception e) { return false; }
+    }
+
+    /**
+     * worker 线程内实际执行取消逻辑。
+     */
+    private boolean doCancel(TaskEntry entry) {
+        if (entry.state == TaskEntry.ST_CANCELLED) return false;
+        if (entry.state == TaskEntry.ST_INIT) {
+            entry.state = TaskEntry.ST_CANCELLED;
+            pendingCount.decrement();
+            cancelledCount.increment();
+            // 快速移除
+            if (entry.bucketIndex >= 0 && entry.bucketIndex < ticksPerWheel) {
+                wheel[entry.bucketIndex].remove(entry);
+            } else {
+                for (Bucket bucket : wheel) {
+                    if (bucket.remove(entry)) break;
+                }
+            }
+            entry.bucketIndex = -1;
+            recycle(entry);
+            return true;
+        } else if (entry.state == TaskEntry.ST_EXPIRED) {
+            // 已过期但尚未重新调度，阻止后续周期
+            entry.state = TaskEntry.ST_CANCELLED;
+            stoppedCount.increment();
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * worker 线程内实际执行重排逻辑。
+     */
+    private boolean doReschedule(TaskEntry entry, long newDelayMs) {
+        if (entry.state != TaskEntry.ST_INIT) return false;
+
+        // 若新延迟为 0，立即转为执行
+        if (newDelayMs <= 0) {
+            entry.state = TaskEntry.ST_EXPIRED;
+            pendingCount.decrement();
+            taskExecutor.execute(() -> executeImmediate(entry));
+            return true;
+        }
+
+        // 从原桶移除
+        boolean removed = false;
+        if (entry.bucketIndex >= 0 && entry.bucketIndex < ticksPerWheel) {
+            removed = wheel[entry.bucketIndex].remove(entry);
+        }
+        if (!removed) {
+            for (Bucket bucket : wheel) {
+                if (bucket.remove(entry)) {
+                    removed = true;
+                    break;
+                }
+            }
+        }
+        if (!removed) return false;
+
+        // 计算新位置并重新入桶
+        long delayTicks = TimeUnit.MILLISECONDS.toNanos(newDelayMs) / tickDurationNs;
+        if (delayTicks > Long.MAX_VALUE - 1) delayTicks = Long.MAX_VALUE - 1;
+        final long totalTicks = delayTicks;
+        final int ticks = (int) (totalTicks % ticksPerWheel) == 0 && totalTicks > 0 ? 1 : (int) (totalTicks % ticksPerWheel);
+        final long rounds = totalTicks / ticksPerWheel;
+        final int newStopIndex = (int) ((currentTick.get() + ticks) % ticksPerWheel);
+
+        entry.remainingRounds = rounds;
+        entry.createTimeNanos = System.nanoTime();
+        entry.bucketIndex = newStopIndex;
+        wheel[newStopIndex].add(entry);
+        return true;
+    }
+
+    /** 获取当前待处理的任务数量（近似值）。 */
+    public long pendingTasks() {
+        return pendingCount.sum();
+    }
+
+    // ==================== 关闭 ====================
+
+    /** 立即关闭时间轮，等待 worker 线程最多 2 秒，不保证剩余任务执行。 */
+    public void shutdown() {
+        workerThread.interrupt();
+        try { workerThread.join(2000); } catch (InterruptedException ignored) { }
+        closeExecutor();
+        clearAllBuckets();
+        pendingCount.reset();
+    }
+
+    /**
+     * 优雅关闭，等待所有已提交任务执行完毕或超时。
+     *
+     * @param timeout 最长等待时间
+     * @param unit    时间单位
+     * @return 是否在超时前完成关闭
+     */
+    public boolean shutdownGracefully(long timeout, TimeUnit unit) throws InterruptedException {
+        final long deadline = System.nanoTime() + unit.toNanos(timeout);
+        workerThread.interrupt();
+        while (workerThread.isAlive() && System.nanoTime() < deadline) Thread.sleep(50);
+        while (pendingTasks() > 0 && System.nanoTime() < deadline) Thread.sleep(50);
+        boolean success = closeExecutor(deadline);
+        clearAllBuckets();
+        pendingCount.reset();
+        return success && pendingTasks() == 0;
+    }
+
+    private boolean closeExecutor(long deadline) {
+        if (!internalExecutor) return true;
+        try {
+            taskExecutor.shutdown();
+            final long remain = deadline - System.nanoTime();
+            if (remain > 0) {
+                if (!taskExecutor.awaitTermination(remain, TimeUnit.NANOSECONDS)) {
+                    taskExecutor.shutdownNow();
+                    return false;
+                }
+                return true;
+            } else {
+                taskExecutor.shutdownNow();
+                return false;
+            }
+        } catch (InterruptedException e) {
+            taskExecutor.shutdownNow();
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    private void closeExecutor() {
+        if (internalExecutor) {
+            taskExecutor.shutdown();
+            try { taskExecutor.awaitTermination(3, TimeUnit.SECONDS); } catch (InterruptedException e) { }
+        }
+    }
+
+    private void clearAllBuckets() {
+        for (Bucket bucket : wheel) {
+            final List<TaskEntry> tmp = new ArrayList<>();
+            bucket.drainTo(tmp);
+            for (TaskEntry e : tmp) recycle(e);
+        }
+    }
+
+    // ==================== 执行耗时监控 ====================
+
+    /**
+     * 记录一次业务任务的执行耗时，更新平均与最大耗时统计。
+     */
+    private void recordExecutionTime(long execTimeNs) {
+        taskExecutionCount.increment();
+        totalExecutionTimeNs.add(execTimeNs);
+        long currentMax;
+        do {
+            currentMax = maxExecutionTimeNs.get();
+            if (execTimeNs <= currentMax) break;
+        } while (!maxExecutionTimeNs.compareAndSet(currentMax, execTimeNs));
+    }
+
+    // ==================== 运行时指标 ====================
+    public int getCurrentTick() { return currentTick.get(); }
+    public long getTotalSkippedTicks() { return totalSkippedTicks.get(); }
+    public int getAvailablePermits() { return concurrencyLimiter.availablePermits(); }
+
+    /**
+     * 获取当前完整的运行时指标快照。
+     */
+    public Metrics getMetrics() {
+        long completed = completedTasks.sum();
+        double avgSchedDelayMs = completed > 0 ? (emaDelayNanos.get() / 1_000_000.0) : 0.0;
+        long execCount = taskExecutionCount.sum();
+        double avgExecTimeMs = execCount > 0 ? (totalExecutionTimeNs.sum() / (double) execCount) / 1_000_000.0 : 0.0;
+        double maxExecTimeMs = maxExecutionTimeNs.get() / 1_000_000.0;
+
+        return new Metrics(
+                currentTick.get(), pendingTasks(), totalSkippedTicks.get(),
+                concurrencyLimiter.availablePermits(), maxBucketDepth.get(),
+                completed, cancelledCount.sum(), exceptionCount.sum(),
+                stoppedCount.sum(), avgSchedDelayMs, avgExecTimeMs, maxExecTimeMs
+        );
+    }
+
+    /**
+     * 时间轮运行时指标快照。
+     */
+    public static class Metrics {
+        public final int currentTick;
+        public final long pendingTasks;
+        public final long totalSkippedTicks;
+        public final int availablePermits;
+        public final int maxBucketDepth;
+        public final long completedTasks;
+        public final long cancelledCount;
+        public final long exceptionCount;
+        public final long stoppedCount;
+        public final double emaAvgDelayMs;       // 平均调度延迟（ms）
+        public final double avgExecTimeMs;       // 平均任务执行耗时（ms）
+        public final double maxExecTimeMs;       // 最大任务执行耗时（ms）
+
+        Metrics(int currentTick, long pendingTasks, long totalSkippedTicks,
+                int availablePermits, int maxBucketDepth, long completedTasks,
+                long cancelledCount, long exceptionCount, long stoppedCount,
+                double emaAvgDelayMs, double avgExecTimeMs, double maxExecTimeMs) {
+            this.currentTick = currentTick;
+            this.pendingTasks = pendingTasks;
+            this.totalSkippedTicks = totalSkippedTicks;
+            this.availablePermits = availablePermits;
+            this.maxBucketDepth = maxBucketDepth;
+            this.completedTasks = completedTasks;
+            this.cancelledCount = cancelledCount;
+            this.exceptionCount = exceptionCount;
+            this.stoppedCount = stoppedCount;
+            this.emaAvgDelayMs = emaAvgDelayMs;
+            this.avgExecTimeMs = avgExecTimeMs;
+            this.maxExecTimeMs = maxExecTimeMs;
+        }
+
+        @Override
+        public String toString() {
+            return String.format(
+                    "Metrics{tick=%d, pending=%d, skipped=%d, permits=%d, maxDepth=%d, " +
+                            "completed=%d, cancelled=%d, exceptions=%d, stopped=%d, " +
+                            "avgSchedDelay=%.2fms, avgExec=%.2fms, maxExec=%.2fms}",
+                    currentTick, pendingTasks, totalSkippedTicks, availablePermits, maxBucketDepth,
+                    completedTasks, cancelledCount, exceptionCount, stoppedCount,
+                    emaAvgDelayMs, avgExecTimeMs, maxExecTimeMs);
+        }
+    }
+
+    // ==================== worker 驱动 ====================
+
+    /**
+     * worker 线程主循环：处理外部任务，推进时钟，必要时追赶 tick。
+     */
+    private void run() {
+        long nextTickTime = System.nanoTime();
+
+        while (!Thread.currentThread().isInterrupted()) {
+            // 优先处理所有外部提交的任务（添加/取消/重排）
+            Runnable task;
+            while ((task = externalTasks.poll()) != null) {
+                task.run();
+            }
+
+            long now = System.nanoTime();
+            if (now - nextTickTime >= tickDurationNs) {
+                long behind = now - nextTickTime;
+                long missed = Math.min(behind / tickDurationNs, maxSkipTicks);
+                for (long i = 0; i < missed && !Thread.currentThread().isInterrupted(); i++) {
+                    advanceOneTick();
+                    nextTickTime += tickDurationNs;
+                    totalSkippedTicks.incrementAndGet();
+                }
+                continue;
+            }
+
+            long sleepNs = nextTickTime - System.nanoTime();
+            if (sleepNs > 0) {
+                LockSupport.parkNanos(sleepNs);
+            }
+        }
+    }
+
+    /**
+     * 推进一个 tick：处理当前槽内的所有到期任务，更新指针。
+     */
+    private void advanceOneTick() {
+        int tick = currentTick.get();
+        Bucket bucket = wheel[tick];
+
+        drainBuffer.clear();
+        bucket.drainTo(drainBuffer);
+        int depth = drainBuffer.size();
+        if (depth > maxBucketDepth.get()) maxBucketDepth.set(depth);
+
+        for (TaskEntry e : drainBuffer) {
+            e.bucketIndex = -1; // 离开桶，清除索引
+
+            if (e.state == TaskEntry.ST_CANCELLED || e.state == TaskEntry.ST_EXPIRED) {
+                recycle(e);
+                continue;
+            }
+            if (e.state != TaskEntry.ST_INIT) continue;
+
+            if (e.remainingRounds > 0) {
+                // 还需要等待更多圈
+                e.remainingRounds--;
+                e.bucketIndex = tick;
+                bucket.add(e);
+            } else {
+                // 到期，标记为 EXPIRED 并提交执行
+                if (e.state == TaskEntry.ST_INIT) {
+                    e.state = TaskEntry.ST_EXPIRED;
+                    pendingCount.decrement();
+                    final TaskEntry entry = e;
+                    taskExecutor.execute(() -> executeTask(entry));
+                }
+            }
+        }
+
+        currentTick.set((tick + 1) % ticksPerWheel);
+    }
+
+    /**
+     * 在线程池中执行业务任务，包含并发控制、异常处理、周期重调度。
+     */
+    private void executeTask(TaskEntry entry) {
+        try {
+            concurrencyLimiter.acquire();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return;
+        }
+        long startNs = System.nanoTime();
+        try {
+            if (entry.state == TaskEntry.ST_EXPIRED) {
+                entry.task.accept(entry);
+                recordCompletion(entry);
+                // 周期性任务且未被取消时重新调度
+                if (entry.periodTicks > 0 && entry.state == TaskEntry.ST_EXPIRED) {
+                    reschedulePeriodic(entry);
+                }
+            }
+        } catch (Exception ex) {
+            exceptionHandler.accept(ex);
+            exceptionCount.increment();
+            if (entry.periodTicks > 0 && entry.state == TaskEntry.ST_EXPIRED) {
+                reschedulePeriodic(entry);
+            }
+        } finally {
+            long execTimeNs = System.nanoTime() - startNs;
+            recordExecutionTime(execTimeNs);
+            concurrencyLimiter.release();
+            recycle(entry);
+        }
+    }
+
+    /**
+     * 执行立即任务（delay <= 0），逻辑与 executeTask 类似。
+     */
+    private void executeImmediate(TaskEntry entry) {
+        long startNs = System.nanoTime();
+        try {
+            if (entry.state == TaskEntry.ST_EXPIRED) {
+                entry.task.accept(entry);
+                recordCompletion(entry);
+                if (entry.periodTicks > 0 && entry.state == TaskEntry.ST_EXPIRED) {
+                    reschedulePeriodic(entry);
+                }
+            }
+        } catch (Exception ex) {
+            exceptionHandler.accept(ex);
+            exceptionCount.increment();
+            if (entry.periodTicks > 0 && entry.state == TaskEntry.ST_EXPIRED) {
+                reschedulePeriodic(entry);
+            }
+        } finally {
+            long execTimeNs = System.nanoTime() - startNs;
+            recordExecutionTime(execTimeNs);
+            pendingCount.decrement();
+            recycle(entry);
+        }
+    }
+
+    /**
+     * 更新调度延迟 EMA 统计。
+     */
+    private void recordCompletion(TaskEntry entry) {
+        long delayNs = System.nanoTime() - entry.createTimeNanos;
+        completedTasks.increment();
+        long currentEma = emaDelayNanos.get();
+        long newEma = (long) (EMA_ALPHA * delayNs + (1 - EMA_ALPHA) * currentEma);
+        emaDelayNanos.set(newEma);
+    }
+
+    /**
+     * 为周期性任务创建新节点并放入时间轮，旧节点随后回收。
+     */
+    private void reschedulePeriodic(TaskEntry oldEntry) {
+        final long periodTicks = oldEntry.periodTicks;
+        final int ticks = (int) (periodTicks % ticksPerWheel);
+        final long rounds = periodTicks / ticksPerWheel;
+        final int stopIndex = (int) ((currentTick.get() + ticks) % ticksPerWheel);
+
+        final TaskEntry newEntry = newTaskEntry(oldEntry.task, rounds);
+        newEntry.periodTicks = periodTicks;
+        newEntry.bucketIndex = stopIndex;
+        pendingCount.increment();
+        wheel[stopIndex].add(newEntry);
+    }
+
+    // ==================== 测试主方法 ====================
+    public static void main(String[] args) throws InterruptedException {
+        final SimpleDateFormat sdf = new SimpleDateFormat("HH:mm:ss.SSS");
+        final AionHashedWheelTimer timer = new AionHashedWheelTimer(30, 100, 64, 60);
+
+        // 异常测试
+        timer.newTimeout(self -> { throw new RuntimeException("测试异常"); }, 200);
+        Thread.sleep(300);
+
+        // 短延迟准时性
+        System.out.println("\n[短延迟准时性] 注册 10ms 任务");
+        final long start = System.nanoTime();
+        timer.newTimeout(self -> {
+            long actual = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+            System.out.println("10ms任务实际延迟: " + actual + "ms");
+        }, 10);
+        Thread.sleep(300);
+
+        // 异步 cancel/reschedule
+        System.out.println("\n[异步 cancel/reschedule]");
+        final Timeout t = timer.newTimeout(self -> System.out.println("原始 1s 任务执行"), 1000);
+        Thread.sleep(100);
+        CompletableFuture<Boolean> resFuture = t.rescheduleAsync(300);
+        resFuture.thenAccept(result -> System.out.println("异步 reschedule 成功: " + result));
+        Thread.sleep(400);
+
+        // 周期性任务
+        System.out.println("\n[周期性任务] 间隔 300ms 执行 5 次后停止");
+        final AtomicInteger count = new AtomicInteger(0);
+        final AtomicReference<Timeout> ref = new AtomicReference<>();
+        final Timeout p = timer.scheduleAtFixedRate(self -> {
+            int c = count.incrementAndGet();
+            System.out.println("周期任务第 " + c + " 次执行 @ " + sdf.format(new Date()));
+            if (c >= 5) {
+                ref.get().cancelAsync().thenAccept(ok -> System.out.println("异步取消周期任务: " + ok));
+            }
+        }, 100, 300);
+        ref.set(p);
+        Thread.sleep(2500);
+
+        System.out.println("\n[最终指标] " + timer.getMetrics());
+        boolean graceful = timer.shutdownGracefully(3, TimeUnit.SECONDS);
+        System.out.println("优雅关闭: " + graceful);
+        System.out.println("=== 测试结束 ===");
+    }
+}
