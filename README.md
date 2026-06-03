@@ -28,10 +28,12 @@
     <artifactId>aion-hashed-wheel-timer</artifactId>
     <version>1.0.0</version>
 </dependency>
+```
 
 ### Gradle（待发布）
 ```gradle
 implementation 'top.aion0573.comm:aion-hashed-wheel-timer:1.0.0'
+```
 
 ### 基本用法
 
@@ -88,6 +90,7 @@ m.emaAvgDelayMs;        // 调度延迟的 EMA
 m.completedTasks;       // 已完成任务总数
 m.exceptionCount;       // 异常计数
 // 更多字段...
+```
 
 ## 📦 环境要求
 
