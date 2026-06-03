@@ -19,7 +19,7 @@
 
 ## 🚀 快速开始
 
-### Maven
+### Maven （待发布）
 ```xml
 <dependency>
     <groupId>top.aion0573.comm</groupId>
